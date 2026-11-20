@@ -1,0 +1,17 @@
+[package]
+name = "git-lp-merge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+lpcli = { git = "https://github.com/canonical/lpcli", tag = "v0.5.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
