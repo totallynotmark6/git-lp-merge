@@ -21,13 +21,13 @@ struct Args {
     /// Local or remote-tracking branch to merge.
     source: String,
 
-    /// Launchpad repository path or project name (defaults to the remote URL).
+    /// Restrict proposals to this Launchpad target repository or project.
     #[arg(long)]
     repo: Option<String>,
 
-    /// Git remote whose URL identifies the target repository.
-    #[arg(long, default_value = "origin")]
-    remote: String,
+    /// Restrict proposals to this target remote (otherwise scan all remotes).
+    #[arg(long)]
+    remote: Option<String>,
 
     /// Launchpad source branch name, if different from the local branch name.
     #[arg(long)]
@@ -154,14 +154,16 @@ fn person_name(link: &str) -> Result<&str> {
 
 fn select_candidate(
     candidates: Vec<Candidate>,
-    target_repo: &str,
+    target_repos: &[&str],
     source: &str,
     target: &str,
     proposal_id: Option<u64>,
 ) -> Result<Candidate> {
     let matches = |item: &Candidate| {
         let p = &item.proposal;
-        p.target_git_repository_link.as_deref() == Some(target_repo)
+        p.target_git_repository_link
+            .as_deref()
+            .is_some_and(|repo| target_repos.contains(&repo))
             && p.source_git_path
                 .as_deref()
                 .and_then(|p| p.strip_prefix("refs/heads/"))
@@ -172,6 +174,7 @@ fn select_candidate(
                 == Some(target)
             && proposal_id
                 .is_none_or(|id| p.self_link.as_deref().and_then(git::extract_mp_id) == Some(id))
+            && matches!(p.queue_status.as_deref(), Some("Needs review" | "Approved"))
     };
     let matching: Vec<_> = candidates
         .iter()
@@ -187,7 +190,9 @@ fn select_candidate(
                     p.source_git_path.as_deref() == Some(format!("refs/heads/{source}").as_str());
                 let target_matches =
                     p.target_git_path.as_deref() == Some(format!("refs/heads/{target}").as_str());
-                p.target_git_repository_link.as_deref() == Some(target_repo)
+                p.target_git_repository_link
+                    .as_deref()
+                    .is_some_and(|repo| target_repos.contains(&repo))
                     && (source_matches || target_matches)
             })
             .take(5)
@@ -208,10 +213,11 @@ fn select_candidate(
         };
         bail!(
             "no matching Needs review or Approved proposal for {source} into {target}\n\
-             Searched repository: {target_repo}\n\
+             Target repositories: {}\n\
              Proposals returned: {}\n\
              Close matches (up to 5):{close_matches}\n\
              Check the target repository (--repo or --remote), Launchpad source branch (--source-branch), proposal ID, and credentials.",
+            target_repos.join(", "),
             candidates.len()
         );
     }
@@ -330,6 +336,102 @@ async fn verify_source(
     Ok(())
 }
 
+async fn resolve_repository(client: &LaunchpadClient, input: &str) -> Result<git::GitRepository> {
+    let path = repository_path(input)?;
+    if path.contains("/+git/") || path.starts_with("+git/") || path.starts_with('~') {
+        Ok(git::get_git_repository_by_unique_name(client, &path).await?)
+    } else {
+        Ok(git::get_default_git_repository(client, &path).await?)
+    }
+}
+
+async fn source_proposals(
+    client: &LaunchpadClient,
+    repository: &str,
+    source: &str,
+) -> Result<Vec<Candidate>> {
+    let mut url = Url::parse(api_link(repository)?)?;
+    url.query_pairs_mut()
+        .append_pair("ws.op", "getRefByPath")
+        .append_pair("path", &format!("refs/heads/{source}"));
+    let reference: Value = match client.get_url(url.as_str()).await {
+        Ok(reference) => reference,
+        Err(LpError::NotFound(_)) => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let landing_targets = reference["landing_targets_collection_link"]
+        .as_str()
+        .context("source branch has no landing targets collection")?;
+    let proposals: Vec<Value> = Collection::fetch_all(client, api_link(landing_targets)?).await?;
+    proposals
+        .into_iter()
+        .map(|raw| {
+            Ok(Candidate {
+                proposal: serde_json::from_value(raw.clone())?,
+                raw,
+            })
+        })
+        .collect()
+}
+
+async fn discover_proposals(
+    client: &LaunchpadClient,
+    source_ref: &str,
+    source: &str,
+) -> Result<(Vec<Candidate>, Vec<String>)> {
+    let source_remote = if let Some(reference) = source_ref.strip_prefix("refs/remotes/") {
+        reference
+            .split_once('/')
+            .map(|(remote, _)| remote.to_owned())
+    } else {
+        let remote = git_output(&[
+            "for-each-ref",
+            "--format=%(upstream:remotename)",
+            source_ref,
+        ])?;
+        (!remote.is_empty() && remote != ".").then_some(remote)
+    };
+    let mut repositories = Vec::new();
+    for remote in git_output(&["remote"])?.lines() {
+        let url = git_output(&["remote", "get-url", remote])?;
+        if repository_path(&url).is_err() {
+            continue;
+        }
+        let repository = resolve_repository(client, &url)
+            .await
+            .with_context(|| format!("resolving Launchpad remote {remote}"))?;
+        let link = repository
+            .self_link
+            .context("remote repository has no API link")?;
+        api_link(&link)?;
+        repositories.push((remote.to_owned(), link));
+    }
+    ensure!(
+        !repositories.is_empty(),
+        "no Launchpad remotes found; configure a Launchpad remote or use --repo"
+    );
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (remote, repository) in &repositories {
+        if source_remote
+            .as_ref()
+            .is_some_and(|source_remote| source_remote != remote)
+        {
+            continue;
+        }
+        for candidate in source_proposals(client, repository, source)
+            .await
+            .with_context(|| format!("discovering proposals for {remote}/{source}"))?
+        {
+            if seen.insert(candidate.proposal.self_link.clone()) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    let target_repos = repositories.into_iter().map(|(_, link)| link).collect();
+    Ok((candidates, target_repos))
+}
+
 async fn run(args: Args) -> Result<i32> {
     ensure!(
         !args.source.starts_with('-'),
@@ -352,12 +454,11 @@ async fn run(args: Args) -> Result<i32> {
         git_output(&["rev-parse", "--verify", &format!("{source_ref}^{{commit}}")])?;
     let target_commit = git_output(&["rev-parse", "--verify", "HEAD^{commit}"])?;
 
-    let repo_input = match &args.repo {
-        Some(repo) => repo.clone(),
-        None => git_output(&["remote", "get-url", &args.remote])
-            .context("specify --repo or configure a Launchpad remote")?,
+    let repo_input = match (&args.repo, &args.remote) {
+        (Some(repo), _) => Some(repo.clone()),
+        (None, Some(remote)) => Some(git_output(&["remote", "get-url", remote])?),
+        (None, None) => None,
     };
-    let repo_path = repository_path(&repo_input)?;
     let credentials = if args.public {
         None
     } else {
@@ -373,39 +474,41 @@ async fn run(args: Args) -> Result<i32> {
         }
     };
     let client = LaunchpadClient::new(credentials);
-    let repository = if repo_path.contains("/+git/") || repo_path.starts_with("+git/") {
-        git::get_git_repository(&client, &repo_path).await?
+    let (candidates, target_repos) = if let Some(repo_input) = repo_input {
+        let repository = resolve_repository(&client, &repo_input).await?;
+        let target_repo = repository
+            .self_link
+            .as_deref()
+            .context("repository has no API link")?;
+        api_link(target_repo)?;
+        let unique_name = repository
+            .unique_name
+            .as_deref()
+            .context("repository has no unique name")?;
+        let mut candidates = Vec::new();
+        for status in ["Needs review", "Approved"] {
+            let result = git::list_merge_proposals_raw(&client, unique_name, Some(status)).await?;
+            let entries = result.raw["entries"]
+                .as_array()
+                .context("invalid proposal collection")?;
+            ensure!(
+                entries.len() == result.value.len(),
+                "invalid proposal collection length"
+            );
+            candidates.extend(
+                result
+                    .value
+                    .into_iter()
+                    .zip(entries.iter().cloned())
+                    .map(|(proposal, raw)| Candidate { proposal, raw }),
+            );
+        }
+        (candidates, vec![target_repo.to_owned()])
     } else {
-        git::get_default_git_repository(&client, &repo_path).await?
+        discover_proposals(&client, &source_ref, source).await?
     };
-    let target_repo = repository
-        .self_link
-        .as_deref()
-        .context("repository has no API link")?;
-    api_link(target_repo)?;
-    let unique_name = repository
-        .unique_name
-        .as_deref()
-        .context("repository has no unique name")?;
-    let mut candidates = Vec::new();
-    for status in ["Needs review", "Approved"] {
-        let result = git::list_merge_proposals_raw(&client, unique_name, Some(status)).await?;
-        let entries = result.raw["entries"]
-            .as_array()
-            .context("invalid proposal collection")?;
-        ensure!(
-            entries.len() == result.value.len(),
-            "invalid proposal collection length"
-        );
-        candidates.extend(
-            result
-                .value
-                .into_iter()
-                .zip(entries.iter().cloned())
-                .map(|(proposal, raw)| Candidate { proposal, raw }),
-        );
-    }
-    let selected = select_candidate(candidates, target_repo, source, &target, args.proposal)?;
+    let target_repos: Vec<_> = target_repos.iter().map(String::as_str).collect();
+    let selected = select_candidate(candidates, &target_repos, source, &target, args.proposal)?;
     let proposal = &selected.proposal;
     verify_source(&client, proposal, &source_commit).await?;
     let author = person_name(
@@ -470,7 +573,8 @@ mod tests {
             "web_link": format!("https://code.launchpad.net/~alice/proj/+git/proj/+merge/{id}"),
             "source_git_path": format!("refs/heads/{source}"),
             "target_git_path": "refs/heads/main",
-            "target_git_repository_link": target_repo
+            "target_git_repository_link": target_repo,
+            "queue_status": "Needs review"
         });
         Candidate {
             proposal: serde_json::from_value(raw.clone()).unwrap(),
@@ -486,18 +590,18 @@ mod tests {
             candidate(2, "other", repo),
             candidate(3, "feature", "other"),
         ];
-        let chosen = select_candidate(choices, repo, "feature", "main", None).unwrap();
+        let chosen = select_candidate(choices, &[repo], "feature", "main", None).unwrap();
         assert!(chosen.proposal.self_link.unwrap().ends_with("/1"));
 
         let choices = vec![candidate(1, "feature", repo), candidate(2, "feature", repo)];
         assert!(
-            select_candidate(choices, repo, "feature", "main", None)
+            select_candidate(choices, &[repo], "feature", "main", None)
                 .unwrap_err()
                 .to_string()
                 .contains("multiple proposals")
         );
         let choices = vec![candidate(1, "feature", repo), candidate(2, "feature", repo)];
-        let chosen = select_candidate(choices, repo, "feature", "main", Some(2)).unwrap();
+        let chosen = select_candidate(choices, &[repo], "feature", "main", Some(2)).unwrap();
         assert!(chosen.proposal.self_link.unwrap().ends_with("/2"));
     }
 
@@ -508,7 +612,7 @@ mod tests {
             candidate(1, "launchpad-name", repo),
             candidate(2, "feature", "other"),
         ];
-        let error = select_candidate(choices, repo, "local-name", "main", None)
+        let error = select_candidate(choices, &[repo], "local-name", "main", None)
             .unwrap_err()
             .to_string();
         assert!(error.contains(repo));
@@ -517,6 +621,55 @@ mod tests {
         assert!(error.contains("/+merge/1"));
         assert!(!error.contains("/+merge/2"));
         assert!(error.contains("--source-branch"));
+    }
+
+    #[test]
+    fn uses_proposal_target_among_remotes_not_origin_by_default() {
+        let origin = "https://api.launchpad.net/devel/~me/proj/+git/proj";
+        let upstream = "https://api.launchpad.net/devel/~team/proj/+git/proj";
+        let chosen = select_candidate(
+            vec![candidate(1, "feature", upstream)],
+            &[origin, upstream],
+            "feature",
+            "main",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            chosen.proposal.target_git_repository_link.as_deref(),
+            Some(upstream)
+        );
+        assert!(
+            select_candidate(
+                vec![candidate(1, "feature", upstream)],
+                &[origin],
+                "feature",
+                "main",
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_closed_proposals_and_ambiguous_targets() {
+        let origin = "https://api.launchpad.net/devel/~me/proj/+git/proj";
+        let upstream = "https://api.launchpad.net/devel/~team/proj/+git/proj";
+        let mut closed = candidate(1, "feature", upstream);
+        closed.proposal.queue_status = Some("Merged".into());
+        assert!(select_candidate(vec![closed], &[upstream], "feature", "main", None).is_err());
+        let error = select_candidate(
+            vec![
+                candidate(1, "feature", origin),
+                candidate(2, "feature", upstream),
+            ],
+            &[origin, upstream],
+            "feature",
+            "main",
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("multiple proposals"));
     }
 
     #[test]

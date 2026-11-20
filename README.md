@@ -22,10 +22,24 @@ Check out the target branch, fetch the proposal's source branch, then run:
 git lp-merge feature-branch
 ```
 
-The target Launchpad repository is inferred from the `origin` remote. Use
-`--remote upstream` for another remote, or `--repo '~team/project/+git/repo'`
-to specify the Launchpad repository explicitly. A project name selects its
-default Git repository.
+The command reads the source branch's Launchpad merge proposals and matches
+their **Merge into** repository against all configured Launchpad remotes,
+regardless of their names (`origin`, `upstream`, etc.). The target
+branch must match the checked-out branch. For example:
+
+```sh
+git lp-merge contributor/feature-branch --message-only
+```
+
+For a remote-tracking source, proposals are read from that remote's source
+branch. For a local branch, its upstream remote is used if configured;
+otherwise all Launchpad remotes are checked for the source branch.
+No remotes are added, no branches are switched, and nothing is fetched.
+
+Use `--remote upstream` to restrict the target repository to a particular
+remote, or `--repo '~team/project/+git/repo'` to specify it explicitly (including
+when the target has no local remote). A project name selects its default Git
+repository. These overrides search the specified target repository directly.
 
 The command finds a **Needs review** or **Approved** proposal matching the
 target repository and both branch names. If several match, it lists them and
@@ -47,4 +61,5 @@ an error, matching lpshipit's behavior.
 By default, the tool uses credentials stored by `lpcli login`, or public data
 if no credentials are available. Private proposals may be omitted in public
 mode. Use `--public` to skip loading credentials explicitly. See
-`git lp-merge --help` for all options.
+`git lp-merge -h` for all options. Git intercepts `git lp-merge --help` to
+look for a manual page; use `git-lp-merge --help` for the binary's help.
