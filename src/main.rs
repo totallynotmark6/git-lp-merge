@@ -159,32 +159,68 @@ fn select_candidate(
     target: &str,
     proposal_id: Option<u64>,
 ) -> Result<Candidate> {
-    let mut matching: Vec<_> = candidates
-        .into_iter()
-        .filter(|item| {
-            let p = &item.proposal;
-            p.target_git_repository_link.as_deref() == Some(target_repo)
-                && p.source_git_path
-                    .as_deref()
-                    .and_then(|p| p.strip_prefix("refs/heads/"))
-                    == Some(source)
-                && p.target_git_path
-                    .as_deref()
-                    .and_then(|p| p.strip_prefix("refs/heads/"))
-                    == Some(target)
-                && proposal_id.is_none_or(|id| {
-                    p.self_link.as_deref().and_then(git::extract_mp_id) == Some(id)
-                })
-        })
+    let matches = |item: &Candidate| {
+        let p = &item.proposal;
+        p.target_git_repository_link.as_deref() == Some(target_repo)
+            && p.source_git_path
+                .as_deref()
+                .and_then(|p| p.strip_prefix("refs/heads/"))
+                == Some(source)
+            && p.target_git_path
+                .as_deref()
+                .and_then(|p| p.strip_prefix("refs/heads/"))
+                == Some(target)
+            && proposal_id
+                .is_none_or(|id| p.self_link.as_deref().and_then(git::extract_mp_id) == Some(id))
+    };
+    let matching: Vec<_> = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| matches(item).then_some(index))
         .collect();
     if matching.is_empty() {
-        bail!("no matching Needs review or Approved proposal for {source} into {target}");
+        let close_matches = candidates
+            .iter()
+            .filter(|item| {
+                let p = &item.proposal;
+                let source_matches =
+                    p.source_git_path.as_deref() == Some(format!("refs/heads/{source}").as_str());
+                let target_matches =
+                    p.target_git_path.as_deref() == Some(format!("refs/heads/{target}").as_str());
+                p.target_git_repository_link.as_deref() == Some(target_repo)
+                    && (source_matches || target_matches)
+            })
+            .take(5)
+            .map(|item| {
+                let p = &item.proposal;
+                format!(
+                    "\n  {} -> {} ({})",
+                    p.source_git_path.as_deref().unwrap_or("?"),
+                    p.target_git_path.as_deref().unwrap_or("?"),
+                    p.web_link.as_deref().unwrap_or("URL unavailable")
+                )
+            })
+            .collect::<String>();
+        let close_matches = if close_matches.is_empty() {
+            "\n  none found".to_owned()
+        } else {
+            close_matches
+        };
+        bail!(
+            "no matching Needs review or Approved proposal for {source} into {target}\n\
+             Searched repository: {target_repo}\n\
+             Proposals returned: {}\n\
+             Close matches (up to 5):{close_matches}\n\
+             Check the target repository (--repo or --remote), Launchpad source branch (--source-branch), proposal ID, and credentials.",
+            candidates.len()
+        );
     }
     if matching.len() > 1 {
         let choices = matching
             .iter()
-            .map(|c| {
-                c.proposal
+            .map(|index| {
+                candidates[*index]
+                    .proposal
                     .web_link
                     .as_deref()
                     .unwrap_or("(missing proposal URL)")
@@ -193,7 +229,10 @@ fn select_candidate(
             .join("\n  ");
         bail!("multiple proposals match; select one with --proposal ID:\n  {choices}");
     }
-    Ok(matching.remove(0))
+    Ok(candidates
+        .into_iter()
+        .nth(matching[0])
+        .expect("matching index"))
 }
 
 fn build_message(
@@ -460,6 +499,24 @@ mod tests {
         let choices = vec![candidate(1, "feature", repo), candidate(2, "feature", repo)];
         let chosen = select_candidate(choices, repo, "feature", "main", Some(2)).unwrap();
         assert!(chosen.proposal.self_link.unwrap().ends_with("/2"));
+    }
+
+    #[test]
+    fn no_match_reports_searched_repository_and_nearby_proposals() {
+        let repo = "https://api.launchpad.net/devel/~team/proj/+git/proj";
+        let choices = vec![
+            candidate(1, "launchpad-name", repo),
+            candidate(2, "feature", "other"),
+        ];
+        let error = select_candidate(choices, repo, "local-name", "main", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(repo));
+        assert!(error.contains("Proposals returned: 2"));
+        assert!(error.contains("refs/heads/launchpad-name -> refs/heads/main"));
+        assert!(error.contains("/+merge/1"));
+        assert!(!error.contains("/+merge/2"));
+        assert!(error.contains("--source-branch"));
     }
 
     #[test]
